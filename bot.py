@@ -62,7 +62,7 @@ async def send_lyrics_in_chunks(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = update.effective_chat.id
 
     if len(text) <= MAX_LENGTH:
-        await context.bot.send_message(chat_id=chat_id, text=text)
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
         return
 
     lines = text.split('\n')
@@ -70,13 +70,13 @@ async def send_lyrics_in_chunks(update: Update, context: ContextTypes.DEFAULT_TY
 
     for line in lines:
         if len(current_chunk) + len(line) + 1 > MAX_LENGTH:
-            await context.bot.send_message(chat_id=chat_id, text=current_chunk)
+            await context.bot.send_message(chat_id=chat_id, text=current_chunk, parse_mode="Markdown")
             current_chunk = line + "\n"
         else:
             current_chunk += line + "\n"
 
     if current_chunk:
-        await context.bot.send_message(chat_id=chat_id, text=current_chunk)
+        await context.bot.send_message(chat_id=chat_id, text=current_chunk, parse_mode="Markdown")
 
 def fetch_lrclib_lyrics(track_name: str, artist_name: str) -> str:
     """Fetches plain lyrics from the free LRCLIB API."""
@@ -92,14 +92,14 @@ def fetch_lrclib_lyrics(track_name: str, artist_name: str) -> str:
             lyrics = data.get("plainLyrics")
             if lyrics:
                 return lyrics
-            return "⚠️ Plain lyrics not available for this track."
+            return "_Plain lyrics not available for this track._"
         elif response.status_code == 404:
-            return "❌ Lyrics not found on LRCLIB."
+            return "_❌ Lyrics not found on LRCLIB._"
         else:
-            return f"⚠️ Server returned status code {response.status_code}."
+            return f"_⚠️ Server returned status code {response.status_code}._"
     except Exception as e:
         logger.error(f"LRCLIB API Error: {e}")
-        return "❌ Error connecting to LRCLIB lyrics service."
+        return "_❌ Error connecting to LRCLIB lyrics service._"
 
 # -------------------------------------------------------------------
 # TELEGRAM HANDLERS
@@ -108,7 +108,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command."""
     welcome_text = (
         "🎵 *Welcome to GrooveMaster Bot!*\n\n"
-        "Send me any song title (or artist + song), and I will search for track info and lyrics!"
+        "Send me any *song title* or *artist and song*, and I will find the best matches with albums and lyrics!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -117,14 +117,14 @@ async def search_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
     user_id = update.effective_user.id
     
-    await update.message.reply_text(f"🔍 Searching for: *{query}*...", parse_mode="Markdown")
+    await update.message.reply_text(f"🔍 Searching MusicBrainz for: *{query}*...", parse_mode="Markdown")
 
     try:
         result = musicbrainzngs.search_recordings(query=query, limit=5)
         recordings = result.get("recording-list", [])
 
         if not recordings:
-            await update.message.reply_text("❌ No tracks found. Try refining your search query.")
+            await update.message.reply_text("❌ *No tracks found.* Try refining your search query.")
             return
 
         results_list = []
@@ -132,11 +132,12 @@ async def search_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         for idx, rec in enumerate(recordings):
             track_title = rec.get("title", "Unknown Title")
+            
             artist_name = "Unknown Artist"
             if "artist-credit" in rec and len(rec["artist-credit"]) > 0:
                 artist_name = rec["artist-credit"][0].get("artist", {}).get("name", "Unknown Artist")
 
-            album_name = "Single/Unknown Album"
+            album_name = "Unknown Album"
             if "release-list" in rec and len(rec["release-list"]) > 0:
                 album_name = rec["release-list"][0].get("title", "Unknown Album")
 
@@ -146,21 +147,24 @@ async def search_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "album": album_name
             })
 
-            button_text = f"{idx + 1}. {track_title} - {artist_name}"
+            button_text = f"{idx + 1}. {track_title} ({album_name})"
+            if len(button_text) > 60:
+                button_text = button_text[:57] + "..."
+                
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"select_{idx}")])
 
         USER_SEARCHES[user_id] = results_list
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await update.message.reply_text(
-            "🎶 *Select a song to get lyrics:*",
+            "🎶 *Select the correct track and album below:*",
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
 
     except Exception as e:
         logger.error(f"MusicBrainz search error: {e}")
-        await update.message.reply_text("❌ An error occurred while searching. Please try again.")
+        await update.message.reply_text("❌ *An error occurred while searching. Please try again.*", parse_mode="Markdown")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles inline button selections for song choice."""
@@ -177,17 +181,27 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = USER_SEARCHES.get(user_id)
 
     if not user_data or idx >= len(user_data):
-        await query.edit_message_text("❌ Search session expired. Please search again.")
+        await query.edit_message_text("❌ *Search session expired. Please search again.*", parse_mode="Markdown")
         return
 
     selected_song = user_data[idx]
     track = selected_song["track"]
     artist = selected_song["artist"]
+    album = selected_song["album"]
 
-    await query.edit_message_text(f"📥 Fetching lyrics for *{track}* by *{artist}*...", parse_mode="Markdown")
+    await query.edit_message_text(
+        f"📥 Fetching lyrics for *{track}* by *{artist}* _(Album: {album})_...",
+        parse_mode="Markdown"
+    )
 
     lyrics = fetch_lrclib_lyrics(track_name=track, artist_name=artist)
-    header = f"🎤 *{track}* - *{artist}*\n" + ("=" * 30) + "\n\n"
+    
+    header = (
+        f"🎤 *{track}*\n"
+        f"👤 Artist: *{artist}*\n"
+        f"💿 Album: *{album}*\n"
+        f"────────────────────────\n\n"
+    )
     full_text = header + lyrics
 
     await send_lyrics_in_chunks(update, context, full_text)
