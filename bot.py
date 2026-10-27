@@ -19,7 +19,7 @@ from telegram.ext import (
 # CONFIGURATION
 # -------------------------------------------------------------------
 # Set this as an environment variable on Render (never hardcode it)
-TELEGRAM_BOT_TOKEN = os.environ["8724485150:AAEbDfndk1cr1EbqikY_XNxSsJq4vJK7G6k"]
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 DEEZER = "https://api.deezer.com"
 
@@ -114,7 +114,8 @@ def _base_title(title: str) -> str:
 
 
 def get_studio_albums(artist_id: int):
-    """Fetch all of an artist's albums from Deezer and keep only studio albums."""
+    """Albums exactly as Deezer lists them (record_type == 'album').
+    No keyword filtering: this matches the Albums tab in the Deezer app."""
     albums, index = [], 0
     while True:
         data = deezer_get(
@@ -126,34 +127,25 @@ def get_studio_albums(artist_id: int):
         if not batch or not data.get("next") or index >= 500:
             break
 
-    best = {}  # base title -> album
+    seen, result = set(), []
     for alb in albums:
         if alb.get("record_type") != "album":
             continue
         title = alb.get("title", "")
-        if not title or _is_extra(title):
+        key = title.strip().lower()
+        if not title or key in seen:
             continue
-        edition = _is_edition(title)
-        key = _base_title(title)
+        seen.add(key)
         date = alb.get("release_date") or "9999-99-99"
-        entry = {
+        result.append({
             "id": alb["id"],
-            "title": _clean_title(title) if edition else title,
+            "title": title,
             "year": date[:4],
             "date": date,
-            "edition": edition,
             "cover": alb.get("cover_xl") or alb.get("cover_big"),
-        }
-        cur = best.get(key)
-        # prefer plain versions over editions, then the earliest release
-        if (
-            cur is None
-            or (cur["edition"] and not edition)
-            or (cur["edition"] == edition and date < cur["date"])
-        ):
-            best[key] = entry
+        })
 
-    return sorted(best.values(), key=lambda a: a["date"])
+    return sorted(result, key=lambda a: a["date"])
 
 
 def get_album_tracks(album_id: int):
@@ -252,7 +244,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Deezer artist search error: {e}")
-        await update.message.reply_text("❌ An error occurred while searching. Please try again.")
+        await update.message.reply_text(f"❌ Search error: {str(e)[:200]}")
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -308,7 +300,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logger.error(f"Deezer albums error: {e}")
-            await query.edit_message_text("❌ Error loading albums. Please try searching again.")
+            await query.edit_message_text(f"❌ Error loading albums: {str(e)[:200]}")
 
     # STEP 2: Album ➔ cover + tracklist
     elif data.startswith("alb_"):
