@@ -1,6 +1,9 @@
+import os
+import threading
 import logging
 import requests
 import musicbrainzngs
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -32,6 +35,23 @@ logger = logging.getLogger(__name__)
 
 # User search state cache: { user_id: [ {artist, track, album}, ... ] }
 USER_SEARCHES = {}
+
+# -------------------------------------------------------------------
+# HEALTH CHECK SERVER (For Render Web Service)
+# -------------------------------------------------------------------
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+    def log_message(self, format, *args):
+        pass
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
 
 # -------------------------------------------------------------------
 # HELPER FUNCTIONS
@@ -176,6 +196,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN APPLICATION
 # -------------------------------------------------------------------
 def main():
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
