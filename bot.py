@@ -186,7 +186,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ *Session expired. Send an artist name to start over.*", parse_mode="Markdown")
         return
 
-    # STEP 1: Artist Selected ➔ Fetch ONLY Studio Albums (Strictly Filtered & Sorted)
+    # STEP 1: Artist Selected ➔ Fetch ONLY Studio Albums (Filtered & Sorted)
     if data.startswith("art_"):
         idx = int(data.split("_")[1])
         selected_artist = user_state["artists"][idx]
@@ -199,7 +199,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             releases_result = musicbrainzngs.browse_releases(
                 artist=artist_id, 
                 release_type=["album"], 
-                strict=True, 
                 limit=100
             )
             releases = releases_result.get("release-list", [])
