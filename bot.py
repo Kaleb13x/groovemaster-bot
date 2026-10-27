@@ -33,8 +33,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# User search state cache: { user_id: [ {artist, track, album}, ... ] }
-USER_SEARCHES = {}
+# User state storage for hierarchical navigation: { user_id: {state data} }
+USER_STATES = {}
 
 # -------------------------------------------------------------------
 # HEALTH CHECK SERVER (For Render Web Service)
@@ -108,103 +108,207 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command."""
     welcome_text = (
         "🎵 *Welcome to GrooveMaster Bot!*\n\n"
-        "Send me any *song title* or *artist and song*, and I will find the best matches with albums and lyrics!"
+        "Send me an *artist name* (e.g., _Eminem_, _Nas_, _Jay-Z_), and I will let you browse their albums and tracklists!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
-async def search_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Searches MusicBrainz for tracks based on user input."""
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Searches MusicBrainz for artists based on user input."""
     query = update.message.text.strip()
     user_id = update.effective_user.id
     
-    await update.message.reply_text(f"🔍 Searching MusicBrainz for: *{query}*...", parse_mode="Markdown")
+    await update.message.reply_text(f"🔍 Searching MusicBrainz for artist: *{query}*...", parse_mode="Markdown")
 
     try:
-        result = musicbrainzngs.search_recordings(query=query, limit=5)
-        recordings = result.get("recording-list", [])
+        result = musicbrainzngs.search_artists(query=query, limit=5)
+        artists = result.get("artist-list", [])
 
-        if not recordings:
-            await update.message.reply_text("❌ *No tracks found.* Try refining your search query.")
+        if not artists:
+            await update.message.reply_text("❌ *No artists found.* Try a different name.")
             return
 
-        results_list = []
+        artist_data = []
         keyboard = []
 
-        for idx, rec in enumerate(recordings):
-            track_title = rec.get("title", "Unknown Title")
+        for idx, artist in enumerate(artists):
+            name = artist.get("name", "Unknown Artist")
+            country = artist.get("country", "")
+            disambiguation = artist.get("disambiguation", "")
             
-            artist_name = "Unknown Artist"
-            if "artist-credit" in rec and len(rec["artist-credit"]) > 0:
-                artist_name = rec["artist-credit"][0].get("artist", {}).get("name", "Unknown Artist")
+            label = name
+            if disambiguation:
+                label += f" ({disambiguation})"
+            elif country:
+                label += f" [{country}]"
 
-            album_name = "Unknown Album"
-            if "release-list" in rec and len(rec["release-list"]) > 0:
-                album_name = rec["release-list"][0].get("title", "Unknown Album")
-
-            results_list.append({
-                "track": track_title,
-                "artist": artist_name,
-                "album": album_name
+            artist_data.append({
+                "id": artist.get("id"),
+                "name": name
             })
 
-            button_text = f"{idx + 1}. {track_title} ({album_name})"
-            if len(button_text) > 60:
-                button_text = button_text[:57] + "..."
-                
-            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"select_{idx}")])
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"art_{idx}")])
 
-        USER_SEARCHES[user_id] = results_list
+        USER_STATES[user_id] = {
+            "step": "artist_selected",
+            "artists": artist_data
+        }
+
         reply_markup = InlineKeyboardMarkup(keyboard)
-
         await update.message.reply_text(
-            "🎶 *Select the correct track and album below:*",
+            "👤 *Select the correct artist:*",
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
 
     except Exception as e:
-        logger.error(f"MusicBrainz search error: {e}")
+        logger.error(f"MusicBrainz artist search error: {e}")
         await update.message.reply_text("❌ *An error occurred while searching. Please try again.*", parse_mode="Markdown")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles inline button selections for song choice."""
+    """Handles multi-step button selections: Artist ➔ Album ➔ Track."""
     query = update.callback_query
     await query.answer()
 
     user_id = update.effective_user.id
     data = query.data
+    user_state = USER_STATES.get(user_id)
 
-    if not data.startswith("select_"):
+    if not user_state:
+        await query.edit_message_text("❌ *Session expired. Please send an artist name to start over.*", parse_mode="Markdown")
         return
 
-    idx = int(data.split("_")[1])
-    user_data = USER_SEARCHES.get(user_id)
+    # STEP 1: Artist Selected ➔ Fetch Albums
+    if data.startswith("art_"):
+        idx = int(data.split("_")[1])
+        selected_artist = user_state["artists"][idx]
+        artist_id = selected_artist["id"]
+        artist_name = selected_artist["name"]
 
-    if not user_data or idx >= len(user_data):
-        await query.edit_message_text("❌ *Search session expired. Please search again.*", parse_mode="Markdown")
-        return
+        await query.edit_message_text(f"💿 Fetching albums for *{artist_name}*...", parse_mode="Markdown")
 
-    selected_song = user_data[idx]
-    track = selected_song["track"]
-    artist = selected_song["artist"]
-    album = selected_song["album"]
+        try:
+            releases_result = musicbrainzngs.browse_releases(artist=artist_id, release_type=["album"], limit=15)
+            releases = releases_result.get("release-list", [])
 
-    await query.edit_message_text(
-        f"📥 Fetching lyrics for *{track}* by *{artist}* _(Album: {album})_...",
-        parse_mode="Markdown"
-    )
+            if not releases:
+                await query.edit_message_text(f"❌ *No albums found for {artist_name}.*", parse_mode="Markdown")
+                return
 
-    lyrics = fetch_lrclib_lyrics(track_name=track, artist_name=artist)
-    
-    header = (
-        f"🎤 *{track}*\n"
-        f"👤 Artist: *{artist}*\n"
-        f"💿 Album: *{album}*\n"
-        f"────────────────────────\n\n"
-    )
-    full_text = header + lyrics
+            album_data = []
+            keyboard = []
 
-    await send_lyrics_in_chunks(update, context, full_text)
+            for idx, rel in enumerate(releases):
+                title = rel.get("title", "Unknown Album")
+                date = rel.get("date", "Unknown Year")[:4]
+                
+                album_label = f"{title} ({date})"
+                if len(album_label) > 60:
+                    album_label = album_label[:57] + "..."
+
+                album_data.append({
+                    "id": rel.get("id"),
+                    "title": title
+                })
+
+                keyboard.append([InlineKeyboardButton(album_label, callback_data=f"alb_{idx}")])
+
+            USER_STATES[user_id] = {
+                "step": "album_selected",
+                "artist_name": artist_name,
+                "albums": album_data
+            }
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"💿 *Albums by {artist_name}:*\nSelect an album below:",
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+
+        except Exception as e:
+            logger.error(f"MusicBrainz browse releases error: {e}")
+            await query.edit_message_text("❌ *Error loading albums. Please try searching again.*", parse_mode="Markdown")
+
+    # STEP 2: Album Selected ➔ Fetch Tracklist
+    elif data.startswith("alb_"):
+        idx = int(data.split("_")[1])
+        selected_album = user_state["albums"][idx]
+        album_id = selected_album["id"]
+        album_title = selected_album["title"]
+        artist_name = user_state["artist_name"]
+
+        await query.edit_message_text(f"🎶 Loading tracklist for *{album_title}*...", parse_mode="Markdown")
+
+        try:
+            release_details = musicbrainzngs.get_release_by_id(album_id, includes=["recordings"])
+            release_info = release_details.get("release", {})
+            
+            tracks = []
+            for medium in release_info.get("medium-list", []):
+                for track in medium.get("track-list", []):
+                    rec = track.get("recording", {})
+                    title = rec.get("title")
+                    if title and title not in tracks:
+                        tracks.append(title)
+
+            if not tracks:
+                await query.edit_message_text(f"❌ *No tracks found for this album.*", parse_mode="Markdown")
+                return
+
+            keyboard = []
+            for idx, track_title in enumerate(tracks[:20]): # Limit to 20 tracks for Telegram button limits
+                btn_text = f"{idx + 1}. {track_title}"
+                if len(btn_text) > 60:
+                    btn_text = btn_text[:57] + "..."
+                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"trk_{idx}")])
+
+            USER_STATES[user_id] = {
+                "step": "track_selected",
+                "artist_name": artist_name,
+                "album_title": album_title,
+                "tracks": tracks
+            }
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"🎵 *{album_title}* by *{artist_name}*\nSelect a track to view lyrics:",
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+
+        except Exception as e:
+            logger.error(f"MusicBrainz get release error: {e}")
+            await query.edit_message_text("❌ *Error loading tracklist. Please try again.*", parse_mode="Markdown")
+
+    # STEP 3: Track Selected ➔ Fetch Lyrics
+    elif data.startswith("trk_"):
+        idx = int(data.split("_")[1])
+        tracks = user_state.get("tracks", [])
+        
+        if idx >= len(tracks):
+            await query.edit_message_text("❌ *Selection expired. Please search again.*", parse_mode="Markdown")
+            return
+
+        track_title = tracks[idx]
+        artist_name = user_state["artist_name"]
+        album_title = user_state["album_title"]
+
+        await query.edit_message_text(
+            f"📥 Fetching lyrics for *{track_title}* by *{artist_name}*...",
+            parse_mode="Markdown"
+        )
+
+        lyrics = fetch_lrclib_lyrics(track_name=track_title, artist_name=artist_name)
+        
+        header = (
+            f"🎤 *{track_title}*\n"
+            f"👤 Artist: *{artist_name}*\n"
+            f"💿 Album: *{album_title}*\n"
+            f"────────────────────────\n\n"
+        )
+        full_text = header + lyrics
+
+        await send_lyrics_in_chunks(update, context, full_text)
 
 # -------------------------------------------------------------------
 # MAIN APPLICATION
@@ -216,9 +320,9 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_song))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
-    print("🤖 GrooveMaster Bot is running with LRCLIB lyrics integration...")
+    print("🤖 GrooveMaster Bot is running with Artist ➔ Album ➔ Tracklist workflow...")
     app.run_polling()
 
 if __name__ == "__main__":
