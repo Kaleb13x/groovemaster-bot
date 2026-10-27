@@ -116,8 +116,9 @@ def fetch_lrclib_lyrics(track_name: str, artist_name: str) -> str:
 # TELEGRAM HANDLERS
 # -------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Clean /start command without intro filler."""
-    welcome_text = "Send me any **artist name** to browse their albums, cover art, and lyrics!"
+    """Dynamically uses the bot's name for the welcome greeting."""
+    bot_name = context.bot.first_name or "Music Bot"
+    welcome_text = f"🎵 *Welcome to {bot_name}!*\n\nSend me any **artist name** to browse their albums, cover art, and lyrics!"
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -173,7 +174,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ *An error occurred while searching. Please try again.*", parse_mode="Markdown")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles multi-step button selections: Artist ➔ Album (with Cover Art) ➔ Track."""
+    """Handles multi-step button selections: Artist ➔ Album (Deduplicated with Cover Art) ➔ Track."""
     query = update.callback_query
     await query.answer()
 
@@ -185,7 +186,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ *Session expired. Send an artist name to start over.*", parse_mode="Markdown")
         return
 
-    # STEP 1: Artist Selected ➔ Fetch Albums
+    # STEP 1: Artist Selected ➔ Fetch Albums (with deduplication)
     if data.startswith("art_"):
         idx = int(data.split("_")[1])
         selected_artist = user_state["artists"][idx]
@@ -195,17 +196,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"💿 Fetching albums for *{artist_name}*...", parse_mode="Markdown")
 
         try:
-            releases_result = musicbrainzngs.browse_releases(artist=artist_id, release_type=["album"], limit=15)
+            releases_result = musicbrainzngs.browse_releases(artist=artist_id, release_type=["album"], limit=50)
             releases = releases_result.get("release-list", [])
 
             if not releases:
                 await query.edit_message_text(f"❌ *No albums found for {artist_name}.*", parse_mode="Markdown")
                 return
 
+            # Deduplicate albums by title
+            seen_titles = set()
+            unique_releases = []
+            for rel in releases:
+                title = rel.get("title")
+                if title and title not in seen_titles:
+                    seen_titles.add(title)
+                    unique_releases.append(rel)
+
             album_data = []
             keyboard = []
 
-            for idx, rel in enumerate(releases):
+            for idx, rel in enumerate(unique_releases[:15]): # Limit to top 15 unique albums
                 title = rel.get("title", "Unknown Album")
                 date = rel.get("date", "Unknown Year")[:4]
                 
