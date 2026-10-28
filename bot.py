@@ -22,6 +22,7 @@ from audd import AudD, AudDAPIError, AudDInvalidAudioError
 # -------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # Your Telegram Chat ID to receive user activity logs
  
 if not TELEGRAM_BOT_TOKEN or not AUDD_API_TOKEN:
     raise SystemExit(
@@ -124,6 +125,16 @@ async def ask_language(message):
     await message.reply_text(
         STRINGS["en"]["choose_lang"], reply_markup=language_keyboard()
     )
+
+
+async def notify_admin(context, text: str):
+    """Send user activity logs to the bot owner's chat ID if configured."""
+    if not ADMIN_CHAT_ID:
+        return
+    try:
+        await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=text)
+    except Exception as e:
+        logger.warning(f"Failed to notify admin: {e}")
  
 # -------------------------------------------------------------------
 # HEALTH SERVER (Render)
@@ -324,6 +335,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_language(update.message)
         return
  
+    user = update.effective_user
+    await notify_admin(
+        context,
+        f"🔎 **Text Search Activity**\n"
+        f"👤 User: {user.full_name} (@{user.username or 'None'}, ID: `{user.id}`)\n"
+        f"💬 Query: `{query}`"
+    )
+
     status = await update.message.reply_text(tr(context, "searching"))
     tracks = await asyncio.to_thread(search_deezer_tracks, query)
  
@@ -362,6 +381,14 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(tr(context, "track_failed"))
         return
  
+    user = update.effective_user
+    await notify_admin(
+        context,
+        f"🎵 **Track Selected**\n"
+        f"👤 User: {user.full_name} (@{user.username or 'None'}, ID: `{user.id}`)\n"
+        f"🎧 Song: {track['title']} - {track['artist']}"
+    )
+
     lyrics = await asyncio.to_thread(
         fetch_lyrics,
         track["artist"],
@@ -417,6 +444,13 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
     if not file_id:
         return
  
+    user = update.effective_user
+    await notify_admin(
+        context,
+        f"🎙️ **Audio/Voice Recognition Request**\n"
+        f"👤 User: {user.full_name} (@{user.username or 'None'}, ID: `{user.id}`)"
+    )
+
     status = await msg.reply_text(tr(context, "listening"))
  
     try:
@@ -429,6 +463,13 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
  
         artist, title, album = song["artist"], song["title"], song["album"]
  
+        await notify_admin(
+            context,
+            f"✅ **Audio Recognized Successfully**\n"
+            f"👤 User: {user.full_name} (ID: `{user.id}`)\n"
+            f"🎶 Identified: {title} - {artist}"
+        )
+
         lyrics = await asyncio.to_thread(fetch_lyrics, artist, title, album)
         if not lyrics:
             await status.edit_text(tr(context, "lyrics_missing"))
@@ -477,4 +518,3 @@ def main():
  
 if __name__ == "__main__":
     main()
- 
