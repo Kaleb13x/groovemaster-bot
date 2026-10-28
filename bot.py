@@ -1,15 +1,17 @@
 import os
 import io
+import re
 import asyncio
 import threading
 import logging
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -34,12 +36,11 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
  
-# AudD client (sync)
 audd_client = AudD(AUDD_API_TOKEN)
  
-# Deezer / Lyrics endpoints
 DEEZER_API = "https://api.deezer.com"
-LRCLIB_API = "https://lrclib.net/api/get"
+LRCLIB_GET = "https://lrclib.net/api/get"
+LRCLIB_SEARCH = "https://lrclib.net/api/search"
  
 # -------------------------------------------------------------------
 # HEALTH SERVER (Render)
@@ -48,7 +49,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Voice-ID bot alive")
+        self.wfile.write(b"Lyrics bot alive")
  
     def log_message(self, format, *args):
         pass
@@ -59,70 +60,126 @@ def run_health_server():
     HTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
  
 # -------------------------------------------------------------------
-# HELPERS
+# DEEZER (finding the right song)
 # -------------------------------------------------------------------
-async def fetch_telegram_file(context, file_id: str) -> bytes:
-    """Download any Telegram file (voice/audio) into memory."""
-    tg_file = await context.bot.get_file(file_id)
-    buf = io.BytesIO()
-    await tg_file.download_to_memory(buf)
-    return buf.getvalue()
- 
- 
-def recognize_audio(audio_bytes: bytes) -> dict | None:
-    """Call AudD. Returns song dict or None. Raises on fatal errors."""
-    # AudD SDK accepts bytes directly; we use the sync client in a thread.
-    # The SDK returns a model with .artist, .title, etc., or None.
-    result = audd_client.recognize(audio_bytes)
-    if result is None:
-        return None
-    return {
-        "artist": result.artist or "",
-        "title": result.title or "",
-        "album": result.album or "",
-    }
- 
- 
-def search_deezer_preview(artist: str, title: str) -> str | None:
-    """Find the 30s preview URL on Deezer. Returns None if not found."""
-    query = f"{artist} {title}".strip()
-    if not query:
-        return None
+def search_deezer_tracks(query: str, limit: int = 8) -> list[dict]:
+    """Search Deezer and return distinct (title, artist) matches."""
     try:
         resp = requests.get(
             f"{DEEZER_API}/search",
-            params={"q": query, "limit": 1},
+            params={"q": query, "limit": 25},
             timeout=10,
         )
         resp.raise_for_status()
-        data = resp.json()
-        tracks = data.get("data", [])
-        if not tracks:
-            return None
-        return tracks[0].get("preview")  # 30s MP3 URL
+        results = []
+        seen = set()
+        for t in resp.json().get("data", []):
+            key = (t["title"].lower(), t["artist"]["name"].lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(
+                {
+                    "id": t["id"],
+                    "title": t["title"],
+                    "artist": t["artist"]["name"],
+                    "album": t.get("album", {}).get("title", ""),
+                    "duration": t.get("duration", 0),
+                }
+            )
+            if len(results) >= limit:
+                break
+        return results
     except Exception as e:
-        logger.warning(f"Deezer preview search failed: {e}")
+        logger.warning(f"Deezer search failed: {e}")
+        return []
+ 
+ 
+def get_deezer_track(track_id: int) -> dict | None:
+    try:
+        resp = requests.get(f"{DEEZER_API}/track/{track_id}", timeout=10)
+        resp.raise_for_status()
+        t = resp.json()
+        if "error" in t:
+            return None
+        return {
+            "id": t["id"],
+            "title": t["title"],
+            "artist": t["artist"]["name"],
+            "album": t.get("album", {}).get("title", ""),
+            "duration": t.get("duration", 0),
+        }
+    except Exception as e:
+        logger.warning(f"Deezer track fetch failed: {e}")
+        return None
+ 
+# -------------------------------------------------------------------
+# LYRICS (LRCLIB)
+# -------------------------------------------------------------------
+def clean_title(title: str) -> str:
+    """'Song (feat. X) - Remastered 2011' -> 'Song'"""
+    t = re.sub(r"\s*[\(\[].*?[\)\]]", "", title)
+    t = re.sub(r"\s+-\s+.*$", "", t)
+    return t.strip() or title
+ 
+ 
+def lrclib_get(artist, title, album="", duration=0) -> str | None:
+    params = {"track_name": title, "artist_name": artist}
+    if album:
+        params["album_name"] = album
+    if duration:
+        params["duration"] = duration
+    try:
+        r = requests.get(LRCLIB_GET, params=params, timeout=10)
+        if r.status_code == 200:
+            return r.json().get("plainLyrics")
+    except Exception as e:
+        logger.warning(f"LRCLIB get failed: {e}")
+    return None
+ 
+ 
+def lrclib_search(artist, title, duration=0) -> str | None:
+    try:
+        r = requests.get(
+            LRCLIB_SEARCH,
+            params={"q": f"{artist} {title}"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        candidates = [
+            c for c in r.json()
+            if c.get("plainLyrics")
+            and artist.lower() in (c.get("artistName") or "").lower()
+        ]
+        if not candidates:
+            return None
+        if duration:
+            candidates.sort(key=lambda c: abs((c.get("duration") or 0) - duration))
+        return candidates[0]["plainLyrics"]
+    except Exception as e:
+        logger.warning(f"LRCLIB search failed: {e}")
         return None
  
  
-def fetch_lyrics(artist: str, title: str) -> str:
-    """Fetch plain lyrics from LRCLIB."""
-    try:
-        resp = requests.get(
-            LRCLIB_API,
-            params={"track_name": title, "artist_name": artist},
-            timeout=10,
-        )
-        if resp.status_code == 404:
-            return "❌ Lyrics not found on LRCLIB."
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("plainLyrics") or "⚠️ Plain lyrics not available for this track."
-    except Exception as e:
-        logger.warning(f"LRCLIB failed: {e}")
-        return "⚠️ Could not reach the lyrics service right now."
+def fetch_lyrics(artist: str, title: str, album: str = "", duration: int = 0) -> str:
+    """Try exact match first, then looser matches."""
+    base = clean_title(title)
+    attempts = [
+        lambda: lrclib_get(artist, title, album, duration),
+        lambda: lrclib_get(artist, title),
+        lambda: lrclib_get(artist, base),
+        lambda: lrclib_search(artist, base, duration),
+    ]
+    for attempt in attempts:
+        lyrics = attempt()
+        if lyrics:
+            return lyrics
+    return "❌ Lyrics not found for this one."
  
- 
+# -------------------------------------------------------------------
+# SENDING
+# -------------------------------------------------------------------
 async def send_lyrics_chunked(chat_id: int, context, header: str, lyrics: str):
     """Split long lyrics into <4096 char messages."""
     MAX = 4000
@@ -131,9 +188,7 @@ async def send_lyrics_chunked(chat_id: int, context, header: str, lyrics: str):
         await context.bot.send_message(chat_id=chat_id, text=full)
         return
  
-    # Send header first if it's long
-    if len(header) > 200:
-        await context.bot.send_message(chat_id=chat_id, text=header)
+    await context.bot.send_message(chat_id=chat_id, text=header)
  
     current = ""
     for line in lyrics.split("\n"):
@@ -146,22 +201,98 @@ async def send_lyrics_chunked(chat_id: int, context, header: str, lyrics: str):
     if current.strip():
         await context.bot.send_message(chat_id=chat_id, text=current)
  
+ 
+def make_header(title, artist, album):
+    header = f"🎤 {title}\n👤 {artist}"
+    if album:
+        header += f"\n💿 {album}"
+    return header
+ 
 # -------------------------------------------------------------------
 # HANDLERS
 # -------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎤 *Voice → Song ID Bot*\n\n"
-        "Send me a **voice note** or **audio file** of a song playing, "
-        "and I'll tell you what it is, send a 30s preview, and fetch the lyrics.\n\n"
-        "Just record a few seconds — it works best with clear audio.",
-        parse_mode="Markdown",
+        "🎤 Lyrics Bot\n\n"
+        "• Type a song name (add the artist for best results, "
+        "like \"humble kendrick\") and pick the right version.\n"
+        "• Or send a voice note / audio of a song playing and I'll identify it "
+        "and send the lyrics."
     )
  
  
-async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reply to normal text messages so the bot never looks dead."""
-    await update.message.reply_text("Send me a voice note or audio file of a song 🎧")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = (update.message.text or "").strip()
+    if not query:
+        return
+ 
+    status = await update.message.reply_text("🔎 Searching...")
+    tracks = await asyncio.to_thread(search_deezer_tracks, query)
+ 
+    if not tracks:
+        await status.edit_text("❌ No songs found. Try adding the artist's name.")
+        return
+ 
+    buttons = []
+    for t in tracks:
+        label = f"{t['title']} — {t['artist']}"
+        if t["album"]:
+            label += f" ({t['album']})"
+        buttons.append(
+            [InlineKeyboardButton(label[:60], callback_data=f"t:{t['id']}")]
+        )
+ 
+    await status.edit_text(
+        "Which one do you mean? 👇",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+ 
+ 
+async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+ 
+    try:
+        track_id = int(q.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        return
+ 
+    await q.edit_message_text("📜 Getting lyrics...")
+ 
+    track = await asyncio.to_thread(get_deezer_track, track_id)
+    if not track:
+        await q.edit_message_text("❌ Couldn't load that song. Try searching again.")
+        return
+ 
+    lyrics = await asyncio.to_thread(
+        fetch_lyrics,
+        track["artist"],
+        track["title"],
+        track["album"],
+        track["duration"],
+    )
+ 
+    header = make_header(track["title"], track["artist"], track["album"])
+    await send_lyrics_chunked(q.message.chat_id, context, header, lyrics)
+    await q.delete_message()
+ 
+ 
+async def fetch_telegram_file(context, file_id: str) -> bytes:
+    tg_file = await context.bot.get_file(file_id)
+    buf = io.BytesIO()
+    await tg_file.download_to_memory(buf)
+    return buf.getvalue()
+ 
+ 
+def recognize_audio(audio_bytes: bytes) -> dict | None:
+    result = audd_client.recognize(audio_bytes)
+    if result is None:
+        return None
+    return {
+        "artist": result.artist or "",
+        "title": result.title or "",
+        "album": result.album or "",
+    }
  
  
 async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,7 +300,6 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
     if not msg:
         return
  
-    # Accept voice notes, audio files, or documents that are audio
     file_id = None
     if msg.voice:
         file_id = msg.voice.file_id
@@ -184,10 +314,7 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
     status = await msg.reply_text("🎧 Listening...")
  
     try:
-        # 1. Download audio
         audio_bytes = await fetch_telegram_file(context, file_id)
- 
-        # 2. Recognize with AudD (run in thread to not block the loop)
         song = await asyncio.to_thread(recognize_audio, audio_bytes)
  
         if not song:
@@ -196,40 +323,10 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
  
-        artist = song["artist"]
-        title = song["title"]
-        album = song["album"]
+        artist, title, album = song["artist"], song["title"], song["album"]
  
-        # 3. Fetch preview + lyrics in parallel
-        preview_task = asyncio.to_thread(search_deezer_preview, artist, title)
-        lyrics_task = asyncio.to_thread(fetch_lyrics, artist, title)
- 
-        preview_url, lyrics = await asyncio.gather(preview_task, lyrics_task)
- 
-        # 4. Send preview audio (if available)
-        if preview_url:
-            try:
-                # Download preview bytes to avoid Telegram URL fetch issues
-                preview_resp = await asyncio.to_thread(requests.get, preview_url, timeout=15)
-                preview_resp.raise_for_status()
-                audio_buf = io.BytesIO(preview_resp.content)
-                audio_buf.name = f"{title}.mp3"
- 
-                await context.bot.send_audio(
-                    chat_id=msg.chat_id,
-                    audio=audio_buf,
-                    title=title,
-                    performer=artist,
-                    caption=f"🎵 {title} — {artist}",
-                )
-            except Exception as e:
-                logger.warning(f"Preview send failed: {e}")
-                await msg.reply_text("⚠️ Couldn't send the preview audio, but here are the lyrics:")
- 
-        # 5. Send lyrics (plain text header, no Markdown, so odd characters can't break it)
-        header = f"🎤 {title}\n👤 {artist}\n💿 {album}" if album else f"🎤 {title}\n👤 {artist}"
-        await send_lyrics_chunked(msg.chat_id, context, header, lyrics)
- 
+        lyrics = await asyncio.to_thread(fetch_lyrics, artist, title, album)
+        await send_lyrics_chunked(msg.chat_id, context, make_header(title, artist, album), lyrics)
         await status.delete()
  
     except AudDInvalidAudioError:
@@ -255,10 +352,16 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
  
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.AUDIO, handle_voice_or_audio))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
+    app.add_handler(CallbackQueryHandler(handle_pick, pattern=r"^t:\d+$"))
+    app.add_handler(
+        MessageHandler(
+            filters.VOICE | filters.AUDIO | filters.Document.AUDIO,
+            handle_voice_or_audio,
+        )
+    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
  
-    print("🎤 Voice-ID bot is running...")
+    print("🎤 Lyrics bot is running...")
     app.run_polling()
  
  
