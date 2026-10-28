@@ -18,10 +18,7 @@ from telegram.ext import (
 # -------------------------------------------------------------------
 # CONFIGURATION
 # -------------------------------------------------------------------
-# Set this as an environment variable on Render (never hardcode it).
-# The text in the brackets is the variable NAME, not the token itself.
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-
+TELEGRAM_BOT_TOKEN = os.environ["8724485150:AAEbDfndk1cr1EbqikY_XNxSsJq4vJK7G6k"]
 DEEZER = "https://api.deezer.com"
 
 logging.basicConfig(
@@ -68,25 +65,18 @@ def search_artists(query: str):
 
 
 # -------------------------------------------------------------------
-# ALBUM FILTERING (studio albums only)
+# ALBUM FILTERING (same as before)
 # -------------------------------------------------------------------
-# Only strip these when they appear inside a bracketed chunk or as a
-# "- suffix" — i.e. "(Deluxe Edition)", "- Remastered 2011", etc.
 EDITION_MARKERS = re.compile(
     r"\b(deluxe|remaster(ed)?|expanded|anniversary|bonus track[s]?|"
     r"special edition|tour edition|reissue|collector'?s edition)\b",
     re.IGNORECASE,
 )
-
-# Non-studio red flags. Only checked inside brackets/suffixes so that an
-# album literally titled "Live" is not silently dropped.
 NON_STUDIO_MARKERS = re.compile(
     r"\b(live|karaoke|instrumental|demo[s]?|acoustic|unplugged|"
     r"remix(es)?|sessions?)\b",
     re.IGNORECASE,
 )
-
-# Compilation red flags. Checked against the *core* (brackets removed) title.
 COMPILATION_TITLE = re.compile(
     r"\b(greatest hits|best of|the best of|anthology|essentials|"
     r"b-?sides|rarities|collection|hits)\b",
@@ -95,7 +85,6 @@ COMPILATION_TITLE = re.compile(
 
 
 def _suffix_parts(title: str):
-    """Return bracketed chunks + anything after the first ' - '."""
     parts = re.findall(r"[\(\[][^\)\]]*[\)\]]", title)
     if " - " in title:
         parts.append(title.split(" - ", 1)[1])
@@ -103,7 +92,6 @@ def _suffix_parts(title: str):
 
 
 def _is_extra(title: str) -> bool:
-    """True if this album looks like a live/karaoke/compilation release."""
     for p in _suffix_parts(title):
         if NON_STUDIO_MARKERS.search(p):
             return True
@@ -112,19 +100,16 @@ def _is_extra(title: str) -> bool:
 
 
 def _is_edition(title: str) -> bool:
-    """True if a bracketed chunk / '- suffix' marks this as an edition."""
     return any(EDITION_MARKERS.search(p) for p in _suffix_parts(title))
 
 
 def _core_title(title: str) -> str:
-    """Lowercased key used for grouping deluxe/remaster with the plain album."""
     t = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", title)
     t = t.split(" - ")[0]
     return re.sub(r"\s+", " ", t).strip().lower()
 
 
 def _strip_edition_suffix(title: str) -> str:
-    """Display title with edition markers removed (best effort)."""
     t = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", title)
     if " - " in t:
         head, tail = t.split(" - ", 1)
@@ -134,9 +119,6 @@ def _strip_edition_suffix(title: str) -> str:
 
 
 def get_studio_albums(artist_id: int):
-    """Fetch all albums for an artist, keep studio albums + EPs,
-    drop live/compilation releases, and collapse deluxe/remaster
-    re-releases into a single entry per album."""
     albums, index, seen_ids = [], 0, set()
     while True:
         data = deezer_get(
@@ -165,10 +147,8 @@ def get_studio_albums(artist_id: int):
             "date": date,
             "year": (date[:4] if date else "????"),
             "cover": alb.get("cover_xl") or alb.get("cover_big"),
-            "record_type": alb.get("record_type"),
         })
 
-    # Group only on the core title so edition re-releases collapse together.
     groups = {}
     for c in candidates:
         groups.setdefault(_core_title(c["title"]), []).append(c)
@@ -187,19 +167,27 @@ def get_studio_albums(artist_id: int):
 
 
 def get_album_tracks(album_id: int):
+    """Returns list of dicts with id, title, preview URL, duration."""
     data = deezer_get(f"/album/{album_id}/tracks", {"limit": 100})
     tracks = []
+    seen = set()
     for t in data.get("data", []):
         title = t.get("title_short") or t.get("title")
-        if title and title not in tracks:
-            tracks.append(title)
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        tracks.append({
+            "id": t["id"],
+            "title": title,
+            "preview": t.get("preview", ""),  # 30-second MP3 URL
+            "duration": t.get("duration", 30),
+        })
     return tracks
 
 # -------------------------------------------------------------------
 # LYRICS
 # -------------------------------------------------------------------
 def fetch_lrclib_lyrics(track_name: str, artist_name: str) -> str:
-    """Fetches plain lyrics from LRCLIB API."""
     url = "https://lrclib.net/api/get"
     params = {"track_name": track_name, "artist_name": artist_name}
     try:
@@ -216,14 +204,11 @@ def fetch_lrclib_lyrics(track_name: str, artist_name: str) -> str:
 
 
 async def send_lyrics_in_chunks(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Splits long text into chunks under Telegram's 4096 character limit (plain text)."""
     MAX_LENGTH = 4000
     chat_id = update.effective_chat.id
-
     if len(text) <= MAX_LENGTH:
         await context.bot.send_message(chat_id=chat_id, text=text)
         return
-
     current_chunk = ""
     for line in text.split("\n"):
         line = line[:MAX_LENGTH]
@@ -232,7 +217,6 @@ async def send_lyrics_in_chunks(update: Update, context: ContextTypes.DEFAULT_TY
             current_chunk = line + "\n"
         else:
             current_chunk += line + "\n"
-
     if current_chunk.strip():
         await context.bot.send_message(chat_id=chat_id, text=current_chunk)
 
@@ -243,21 +227,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_name = context.bot.first_name or "Music Bot"
     welcome_text = (
         f"🎵 *Welcome to {bot_name}!*\n\n"
-        "Send me any *artist name* to browse their studio albums and lyrics!"
+        "Send me any *artist name* to browse their studio albums, "
+        "get a **30-second preview** and the **lyrics** for any track!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Searches Deezer for artists based on user input."""
     query = update.message.text.strip()
     user_id = update.effective_user.id
-
     await update.message.reply_text(f"🔍 Searching for artist: {query}...")
 
     try:
         artists = await asyncio.to_thread(search_artists, query)
-
         if not artists:
             await update.message.reply_text("❌ No artists found. Try a different name.")
             return
@@ -269,24 +251,20 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = f"{name} ({fans:,} fans)" if fans else name
             if len(label) > 60:
                 label = label[:57] + "..."
-
             artist_data.append({"id": artist["id"], "name": name})
             keyboard.append([InlineKeyboardButton(label, callback_data=f"art_{idx}")])
 
         USER_STATES[user_id] = {"step": "artist_selected", "artists": artist_data}
-
         await update.message.reply_text(
             "👤 Select the artist:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
-
     except Exception as e:
         logger.error(f"Deezer artist search error: {e}")
         await update.message.reply_text(f"❌ Search error: {str(e)[:200]}")
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles multi-step button selections: Artist ➔ Studio Album ➔ Track."""
     query = update.callback_query
     await query.answer()
 
@@ -299,7 +277,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Session expired. Send an artist name to start over.")
         return
 
-    # STEP 1: Artist ➔ studio albums
+    # STEP 1: Artist ➔ albums
     if data.startswith("art_"):
         idx = int(data.split("_")[1])
         artists = user_state.get("artists", [])
@@ -312,7 +290,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             albums = await asyncio.to_thread(get_studio_albums, artist["id"])
-
             if not albums:
                 await query.edit_message_text(f"❌ No studio albums found for {artist['name']}.")
                 return
@@ -330,17 +307,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "artist_name": artist["name"],
                 "albums": albums,
             }
-
             await query.edit_message_text(
                 f"💿 Studio Albums by {artist['name']}:\nSelect an album below:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
-
         except Exception as e:
             logger.error(f"Deezer albums error: {e}")
             await query.edit_message_text(f"❌ Error loading albums: {str(e)[:200]}")
 
-    # STEP 2: Album ➔ cover + tracklist
+    # STEP 2: Album ➔ tracklist
     elif data.startswith("alb_"):
         idx = int(data.split("_")[1])
         albums = user_state.get("albums", [])
@@ -350,19 +325,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         album = albums[idx]
         artist_name = user_state["artist_name"]
-
         await query.edit_message_text(f"🎶 Loading tracklist for {album['title']}...")
 
         try:
             tracks = await asyncio.to_thread(get_album_tracks, album["id"])
-
             if not tracks:
                 await query.edit_message_text("❌ No tracks found for this album.")
                 return
 
             keyboard = []
-            for i, track_title in enumerate(tracks[:50]):
-                btn_text = f"{i + 1}. {track_title}"
+            for i, track in enumerate(tracks[:50]):
+                btn_text = f"{i + 1}. {track['title']}"
                 if len(btn_text) > 60:
                     btn_text = btn_text[:57] + "..."
                 keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"trk_{i}")])
@@ -377,7 +350,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup = InlineKeyboardMarkup(keyboard)
             caption = (
                 f"💿 {album['title']} ({album['year']})\n"
-                f"👤 Artist: {artist_name}\n\nSelect a track to get lyrics:"
+                f"👤 Artist: {artist_name}\n\n"
+                f"Select a track to get the **30-second preview** and **lyrics**:"
             )
 
             sent_photo = False
@@ -387,6 +361,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=chat_id,
                         photo=album["cover"],
                         caption=caption,
+                        parse_mode="Markdown",
                         reply_markup=reply_markup,
                     )
                     await query.delete_message()
@@ -395,17 +370,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Sending cover photo failed: {e}")
 
             if not sent_photo:
-                await query.edit_message_text(caption, reply_markup=reply_markup)
-
+                await query.edit_message_text(caption, parse_mode="Markdown", reply_markup=reply_markup)
         except Exception as e:
             logger.error(f"Deezer tracks error: {e}")
             await query.edit_message_text("❌ Error loading tracklist. Please try again.")
 
-    # STEP 3: Track ➔ lyrics
+    # STEP 3: Track ➔ send preview audio + lyrics
     elif data.startswith("trk_"):
         idx = int(data.split("_")[1])
         tracks = user_state.get("tracks", [])
-
         if idx >= len(tracks):
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -413,14 +386,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        track_title = tracks[idx]
+        track = tracks[idx]
+        track_title = track["title"]
         artist_name = user_state["artist_name"]
         album_title = user_state["album_title"]
+        preview_url = track.get("preview", "")
 
         status_msg = await context.bot.send_message(
-            chat_id=chat_id, text=f"📥 Fetching lyrics for {track_title}..."
+            chat_id=chat_id, text=f"📥 Fetching preview and lyrics for {track_title}..."
         )
 
+        # 1) Try to send the 30-second preview as an audio file
+        preview_sent = False
+        if preview_url:
+            try:
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=preview_url,
+                    title=track_title,
+                    performer=artist_name,
+                    duration=track.get("duration", 30),
+                    caption=f"🎵 30-second preview: {track_title} — {artist_name}",
+                )
+                preview_sent = True
+            except Exception as e:
+                logger.warning(f"Preview send failed for {track_title}: {e}")
+
+        # 2) Fetch and send lyrics (always, regardless of preview success)
         lyrics = await asyncio.to_thread(
             fetch_lrclib_lyrics, track_name=track_title, artist_name=artist_name
         )
@@ -429,73 +421,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎤 {track_title}\n"
             f"👤 Artist: {artist_name}\n"
             f"💿 Album: {album_title}\n"
-            f"────────────────────────\n\n"
         )
+        if not preview_sent:
+            header += "⚠️ Preview audio unavailable (lyrics only)\n"
+        header += "────────────────────────\n\n"
 
         await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
         await send_lyrics_in_chunks(update, context, header + lyrics)
-
-
-async def debug_albums(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/debug <artist name> — dumps raw Deezer album data + filtered result."""
-    if not context.args:
-        await update.message.reply_text("Usage: /debug <artist name>")
-        return
-
-    query = " ".join(context.args)
-    chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🔍 Debugging: {query}")
-
-    try:
-        artists = await asyncio.to_thread(search_artists, query)
-        if not artists:
-            await update.message.reply_text("No artists found.")
-            return
-
-        artist = artists[0]
-        await update.message.reply_text(
-            f"Top match: {artist['name']} (id={artist['id']})"
-        )
-
-        # Raw albums straight from Deezer, no filtering
-        raw = []
-        index = 0
-        while True:
-            data = await asyncio.to_thread(
-                deezer_get,
-                f"/artist/{artist['id']}/albums",
-                {"limit": 100, "index": index},
-            )
-            batch = data.get("data", [])
-            raw.extend(batch)
-            index += len(batch)
-            if not batch or not data.get("next") or index >= 1000:
-                break
-
-        lines = [f"RAW Deezer albums ({len(raw)} total):\n"]
-        for a in raw:
-            lines.append(
-                f"• id={a['id']} | type={a.get('record_type')} | "
-                f"{a.get('release_date', '?')} | {a.get('title')}"
-            )
-        text = "\n".join(lines)
-
-        # Telegram 4096 limit — chunk it
-        for i in range(0, len(text), 4000):
-            await context.bot.send_message(chat_id=chat_id, text=text[i:i + 4000])
-
-        # Now show what OUR filter kept
-        filtered = await asyncio.to_thread(get_studio_albums, artist["id"])
-        flines = [f"\nFILTERED result ({len(filtered)} kept):\n"]
-        for a in filtered:
-            flines.append(f"✓ {a['year']} | {a['title']}")
-        ftext = "\n".join(flines)
-        for i in range(0, len(ftext), 4000):
-            await context.bot.send_message(chat_id=chat_id, text=ftext[i:i + 4000])
-
-    except Exception as e:
-        logger.error(f"Debug error: {e}")
-        await update.message.reply_text(f"❌ Debug error: {e}")
 
 # -------------------------------------------------------------------
 # MAIN APPLICATION
@@ -506,7 +438,6 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("debug", debug_albums))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
