@@ -14,31 +14,33 @@ from telegram.ext import (
     filters,
 )
 from audd import AudD, AudDAPIError, AudDInvalidAudioError
-
+ 
 # -------------------------------------------------------------------
 # CONFIG
 # -------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN")
-
+ 
 if not TELEGRAM_BOT_TOKEN or not AUDD_API_TOKEN:
     raise SystemExit(
         "Missing env vars. Set TELEGRAM_BOT_TOKEN and AUDD_API_TOKEN on Render."
     )
-
+ 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# Stop httpx from printing request URLs (they contain the bot token)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
-
+ 
 # AudD client (sync)
 audd_client = AudD(AUDD_API_TOKEN)
-
+ 
 # Deezer / Lyrics endpoints
 DEEZER_API = "https://api.deezer.com"
 LRCLIB_API = "https://lrclib.net/api/get"
-
+ 
 # -------------------------------------------------------------------
 # HEALTH SERVER (Render)
 # -------------------------------------------------------------------
@@ -47,15 +49,15 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Voice-ID bot alive")
-
+ 
     def log_message(self, format, *args):
         pass
-
-
+ 
+ 
 def run_health_server():
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
-
+ 
 # -------------------------------------------------------------------
 # HELPERS
 # -------------------------------------------------------------------
@@ -65,8 +67,8 @@ async def fetch_telegram_file(context, file_id: str) -> bytes:
     buf = io.BytesIO()
     await tg_file.download_to_memory(buf)
     return buf.getvalue()
-
-
+ 
+ 
 def recognize_audio(audio_bytes: bytes) -> dict | None:
     """Call AudD. Returns song dict or None. Raises on fatal errors."""
     # AudD SDK accepts bytes directly; we use the sync client in a thread.
@@ -79,8 +81,8 @@ def recognize_audio(audio_bytes: bytes) -> dict | None:
         "title": result.title or "",
         "album": result.album or "",
     }
-
-
+ 
+ 
 def search_deezer_preview(artist: str, title: str) -> str | None:
     """Find the 30s preview URL on Deezer. Returns None if not found."""
     query = f"{artist} {title}".strip()
@@ -101,8 +103,8 @@ def search_deezer_preview(artist: str, title: str) -> str | None:
     except Exception as e:
         logger.warning(f"Deezer preview search failed: {e}")
         return None
-
-
+ 
+ 
 def fetch_lyrics(artist: str, title: str) -> str:
     """Fetch plain lyrics from LRCLIB."""
     try:
@@ -119,8 +121,8 @@ def fetch_lyrics(artist: str, title: str) -> str:
     except Exception as e:
         logger.warning(f"LRCLIB failed: {e}")
         return "⚠️ Could not reach the lyrics service right now."
-
-
+ 
+ 
 async def send_lyrics_chunked(chat_id: int, context, header: str, lyrics: str):
     """Split long lyrics into <4096 char messages."""
     MAX = 4000
@@ -128,11 +130,11 @@ async def send_lyrics_chunked(chat_id: int, context, header: str, lyrics: str):
     if len(full) <= MAX:
         await context.bot.send_message(chat_id=chat_id, text=full)
         return
-
+ 
     # Send header first if it's long
     if len(header) > 200:
         await context.bot.send_message(chat_id=chat_id, text=header)
-
+ 
     current = ""
     for line in lyrics.split("\n"):
         line = line[:MAX]
@@ -143,7 +145,7 @@ async def send_lyrics_chunked(chat_id: int, context, header: str, lyrics: str):
             current += line + "\n"
     if current.strip():
         await context.bot.send_message(chat_id=chat_id, text=current)
-
+ 
 # -------------------------------------------------------------------
 # HANDLERS
 # -------------------------------------------------------------------
@@ -155,13 +157,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Just record a few seconds — it works best with clear audio.",
         parse_mode="Markdown",
     )
-
-
+ 
+ 
+async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply to normal text messages so the bot never looks dead."""
+    await update.message.reply_text("Send me a voice note or audio file of a song 🎧")
+ 
+ 
 async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
-
+ 
     # Accept voice notes, audio files, or documents that are audio
     file_id = None
     if msg.voice:
@@ -170,35 +177,35 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
         file_id = msg.audio.file_id
     elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("audio/"):
         file_id = msg.document.file_id
-
+ 
     if not file_id:
         return
-
+ 
     status = await msg.reply_text("🎧 Listening...")
-
+ 
     try:
         # 1. Download audio
         audio_bytes = await fetch_telegram_file(context, file_id)
-
+ 
         # 2. Recognize with AudD (run in thread to not block the loop)
         song = await asyncio.to_thread(recognize_audio, audio_bytes)
-
+ 
         if not song:
             await status.edit_text(
                 "❌ I couldn't recognize that. Try again with clearer audio or a longer clip."
             )
             return
-
+ 
         artist = song["artist"]
         title = song["title"]
         album = song["album"]
-
+ 
         # 3. Fetch preview + lyrics in parallel
         preview_task = asyncio.to_thread(search_deezer_preview, artist, title)
         lyrics_task = asyncio.to_thread(fetch_lyrics, artist, title)
-
+ 
         preview_url, lyrics = await asyncio.gather(preview_task, lyrics_task)
-
+ 
         # 4. Send preview audio (if available)
         if preview_url:
             try:
@@ -207,7 +214,7 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
                 preview_resp.raise_for_status()
                 audio_buf = io.BytesIO(preview_resp.content)
                 audio_buf.name = f"{title}.mp3"
-
+ 
                 await context.bot.send_audio(
                     chat_id=msg.chat_id,
                     audio=audio_buf,
@@ -218,13 +225,13 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as e:
                 logger.warning(f"Preview send failed: {e}")
                 await msg.reply_text("⚠️ Couldn't send the preview audio, but here are the lyrics:")
-
-        # 5. Send lyrics
-        header = f"🎤 *{title}*\n👤 {artist}\n💿 {album}" if album else f"🎤 *{title}*\n👤 {artist}"
+ 
+        # 5. Send lyrics (plain text header, no Markdown, so odd characters can't break it)
+        header = f"🎤 {title}\n👤 {artist}\n💿 {album}" if album else f"🎤 {title}\n👤 {artist}"
         await send_lyrics_chunked(msg.chat_id, context, header, lyrics)
-
+ 
         await status.delete()
-
+ 
     except AudDInvalidAudioError:
         await status.edit_text("❌ AudD rejected the audio format. Try a different file.")
     except AudDAPIError as e:
@@ -233,7 +240,7 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.exception("Unexpected error in voice handler")
         await status.edit_text(f"❌ Something went wrong: {str(e)[:200]}")
-
+ 
 # -------------------------------------------------------------------
 # MAIN (Python 3.14 event-loop fix)
 # -------------------------------------------------------------------
@@ -242,17 +249,18 @@ def main():
         asyncio.get_event_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
-
+ 
     threading.Thread(target=run_health_server, daemon=True).start()
-
+ 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
+ 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.AUDIO, handle_voice_or_audio))
-
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
+ 
     print("🎤 Voice-ID bot is running...")
     app.run_polling()
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
