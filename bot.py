@@ -435,6 +435,68 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
         await send_lyrics_in_chunks(update, context, header + lyrics)
 
+
+async def debug_albums(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/debug <artist name> — dumps raw Deezer album data + filtered result."""
+    if not context.args:
+        await update.message.reply_text("Usage: /debug <artist name>")
+        return
+
+    query = " ".join(context.args)
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"🔍 Debugging: {query}")
+
+    try:
+        artists = await asyncio.to_thread(search_artists, query)
+        if not artists:
+            await update.message.reply_text("No artists found.")
+            return
+
+        artist = artists[0]
+        await update.message.reply_text(
+            f"Top match: {artist['name']} (id={artist['id']})"
+        )
+
+        # Raw albums straight from Deezer, no filtering
+        raw = []
+        index = 0
+        while True:
+            data = await asyncio.to_thread(
+                deezer_get,
+                f"/artist/{artist['id']}/albums",
+                {"limit": 100, "index": index},
+            )
+            batch = data.get("data", [])
+            raw.extend(batch)
+            index += len(batch)
+            if not batch or not data.get("next") or index >= 1000:
+                break
+
+        lines = [f"RAW Deezer albums ({len(raw)} total):\n"]
+        for a in raw:
+            lines.append(
+                f"• id={a['id']} | type={a.get('record_type')} | "
+                f"{a.get('release_date', '?')} | {a.get('title')}"
+            )
+        text = "\n".join(lines)
+
+        # Telegram 4096 limit — chunk it
+        for i in range(0, len(text), 4000):
+            await context.bot.send_message(chat_id=chat_id, text=text[i:i + 4000])
+
+        # Now show what OUR filter kept
+        filtered = await asyncio.to_thread(get_studio_albums, artist["id"])
+        flines = [f"\nFILTERED result ({len(filtered)} kept):\n"]
+        for a in filtered:
+            flines.append(f"✓ {a['year']} | {a['title']}")
+        ftext = "\n".join(flines)
+        for i in range(0, len(ftext), 4000):
+            await context.bot.send_message(chat_id=chat_id, text=ftext[i:i + 4000])
+
+    except Exception as e:
+        logger.error(f"Debug error: {e}")
+        await update.message.reply_text(f"❌ Debug error: {e}")
+
 # -------------------------------------------------------------------
 # MAIN APPLICATION
 # -------------------------------------------------------------------
@@ -444,6 +506,7 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("debug", debug_albums))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
