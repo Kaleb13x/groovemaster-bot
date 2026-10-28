@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import asyncio
 import threading
 import logging
@@ -18,7 +19,7 @@ from telegram.ext import (
 # -------------------------------------------------------------------
 # CONFIGURATION
 # -------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ["8724485150:AAEbDfndk1cr1EbqikY_XNxSsJq4vJK7G6k"]
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 DEEZER = "https://api.deezer.com"
 
 logging.basicConfig(
@@ -65,7 +66,7 @@ def search_artists(query: str):
 
 
 # -------------------------------------------------------------------
-# ALBUM FILTERING (same as before)
+# ALBUM FILTERING (studio albums only)
 # -------------------------------------------------------------------
 EDITION_MARKERS = re.compile(
     r"\b(deluxe|remaster(ed)?|expanded|anniversary|bonus track[s]?|"
@@ -179,10 +180,22 @@ def get_album_tracks(album_id: int):
         tracks.append({
             "id": t["id"],
             "title": title,
-            "preview": t.get("preview", ""),  # 30-second MP3 URL
+            "preview": t.get("preview", ""),
             "duration": t.get("duration", 30),
         })
     return tracks
+
+# -------------------------------------------------------------------
+# PREVIEW DOWNLOAD
+# -------------------------------------------------------------------
+def download_preview(preview_url: str) -> io.BytesIO:
+    """Download the 30s preview MP3 into memory and return a BytesIO
+    with a .name attribute set so Telegram can detect the file type."""
+    resp = requests.get(preview_url, timeout=15)
+    resp.raise_for_status()
+    buf = io.BytesIO(resp.content)
+    buf.name = "preview.mp3"
+    return buf
 
 # -------------------------------------------------------------------
 # LYRICS
@@ -375,7 +388,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Deezer tracks error: {e}")
             await query.edit_message_text("❌ Error loading tracklist. Please try again.")
 
-    # STEP 3: Track ➔ send preview audio + lyrics
+    # STEP 3: Track ➔ download preview + send as audio + lyrics
     elif data.startswith("trk_"):
         idx = int(data.split("_")[1])
         tracks = user_state.get("tracks", [])
@@ -396,13 +409,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id, text=f"📥 Fetching preview and lyrics for {track_title}..."
         )
 
-        # 1) Try to send the 30-second preview as an audio file
+        # 1) Download preview MP3 to memory, then upload to Telegram as a file
         preview_sent = False
         if preview_url:
             try:
+                audio_buf = await asyncio.to_thread(download_preview, preview_url)
                 await context.bot.send_audio(
                     chat_id=chat_id,
-                    audio=preview_url,
+                    audio=audio_buf,
                     title=track_title,
                     performer=artist_name,
                     duration=track.get("duration", 30),
@@ -411,8 +425,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 preview_sent = True
             except Exception as e:
                 logger.warning(f"Preview send failed for {track_title}: {e}")
+        else:
+            logger.warning(f"No preview URL available for {track_title}")
 
-        # 2) Fetch and send lyrics (always, regardless of preview success)
+        # 2) Fetch and send lyrics (always)
         lyrics = await asyncio.to_thread(
             fetch_lrclib_lyrics, track_name=track_title, artist_name=artist_name
         )
@@ -426,7 +442,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             header += "⚠️ Preview audio unavailable (lyrics only)\n"
         header += "────────────────────────\n\n"
 
-        await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+        except Exception:
+            pass
         await send_lyrics_in_chunks(update, context, header + lyrics)
 
 # -------------------------------------------------------------------
