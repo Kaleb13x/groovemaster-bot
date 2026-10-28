@@ -1,9 +1,10 @@
 import os
-import re
 import io
+import re
 import asyncio
 import threading
 import logging
+import textwrap
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,29 +16,34 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # -------------------------------------------------------------------
-# CONFIGURATION
+# CONFIG
 # -------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-DEEZER = "https://api.deezer.com"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_BOT_TOKEN:
+    raise SystemExit("TELEGRAM_BOT_TOKEN env var is not set.")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-USER_STATES = {}
+# In-memory cache: message_id -> {image_bytes, caption, user_id}
+# Kept small on purpose; this is a demo bot, not a persistent store.
+MEME_CACHE = {}
+MAX_CACHE = 200
 
 # -------------------------------------------------------------------
-# HEALTH CHECK SERVER (For Render Web Service)
+# HEALTH SERVER (Render Web Service)
 # -------------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is alive!")
+        self.wfile.write(b"Meme bot is alive!")
 
     def log_message(self, format, *args):
         pass
@@ -45,411 +51,345 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 def run_health_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
 
 # -------------------------------------------------------------------
-# DEEZER HELPERS
+# FONT LOADING (with fallbacks)
 # -------------------------------------------------------------------
-def deezer_get(path: str, params: dict = None):
-    res = requests.get(f"{DEEZER}{path}", params=params, timeout=10)
-    res.raise_for_status()
-    data = res.json()
-    if isinstance(data, dict) and data.get("error"):
-        raise RuntimeError(data["error"])
-    return data
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf",
+    "/usr/share/fonts/truetype/impact/impact.ttf",
+    "C:/Windows/Fonts/impact.ttf",  # local testing
+]
 
 
-def search_artists(query: str):
-    data = deezer_get("/search/artist", {"q": query, "limit": 5})
-    return data.get("data", [])
-
-
-# -------------------------------------------------------------------
-# ALBUM FILTERING (studio albums only)
-# -------------------------------------------------------------------
-EDITION_MARKERS = re.compile(
-    r"\b(deluxe|remaster(ed)?|expanded|anniversary|bonus track[s]?|"
-    r"special edition|tour edition|reissue|collector'?s edition)\b",
-    re.IGNORECASE,
-)
-NON_STUDIO_MARKERS = re.compile(
-    r"\b(live|karaoke|instrumental|demo[s]?|acoustic|unplugged|"
-    r"remix(es)?|sessions?)\b",
-    re.IGNORECASE,
-)
-COMPILATION_TITLE = re.compile(
-    r"\b(greatest hits|best of|the best of|anthology|essentials|"
-    r"b-?sides|rarities|collection|hits)\b",
-    re.IGNORECASE,
-)
-
-
-def _suffix_parts(title: str):
-    parts = re.findall(r"[\(\[][^\)\]]*[\)\]]", title)
-    if " - " in title:
-        parts.append(title.split(" - ", 1)[1])
-    return parts
-
-
-def _is_extra(title: str) -> bool:
-    for p in _suffix_parts(title):
-        if NON_STUDIO_MARKERS.search(p):
-            return True
-    core = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", title).split(" - ")[0]
-    return bool(COMPILATION_TITLE.search(core))
-
-
-def _is_edition(title: str) -> bool:
-    return any(EDITION_MARKERS.search(p) for p in _suffix_parts(title))
-
-
-def _core_title(title: str) -> str:
-    t = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", title)
-    t = t.split(" - ")[0]
-    return re.sub(r"\s+", " ", t).strip().lower()
-
-
-def _strip_edition_suffix(title: str) -> str:
-    t = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", title)
-    if " - " in t:
-        head, tail = t.split(" - ", 1)
-        if EDITION_MARKERS.search(tail):
-            t = head
-    return re.sub(r"\s+", " ", t).strip() or title
-
-
-def get_studio_albums(artist_id: int):
-    albums, index, seen_ids = [], 0, set()
-    while True:
-        data = deezer_get(
-            f"/artist/{artist_id}/albums", {"limit": 100, "index": index}
-        )
-        batch = data.get("data", [])
-        for a in batch:
-            if a["id"] not in seen_ids:
-                seen_ids.add(a["id"])
-                albums.append(a)
-        index += len(batch)
-        if not batch or not data.get("next") or index >= 1000:
-            break
-
-    candidates = []
-    for alb in albums:
-        if alb.get("record_type") not in ("album", "ep"):
-            continue
-        title = (alb.get("title") or "").strip()
-        if not title or _is_extra(title):
-            continue
-        date = alb.get("release_date") or ""
-        candidates.append({
-            "id": alb["id"],
-            "title": title,
-            "date": date,
-            "year": (date[:4] if date else "????"),
-            "cover": alb.get("cover_xl") or alb.get("cover_big"),
-        })
-
-    groups = {}
-    for c in candidates:
-        groups.setdefault(_core_title(c["title"]), []).append(c)
-
-    result = []
-    for items in groups.values():
-        plain = [i for i in items if not _is_edition(i["title"])]
-        if plain:
-            best = dict(min(plain, key=lambda a: a["date"] or "9999-99-99"))
-        else:
-            best = dict(min(items, key=lambda a: a["date"] or "9999-99-99"))
-            best["title"] = _strip_edition_suffix(best["title"])
-        result.append(best)
-
-    return sorted(result, key=lambda a: a["date"] or "9999-99-99")
-
-
-def get_album_tracks(album_id: int):
-    """Returns list of dicts with id, title, preview URL, duration."""
-    data = deezer_get(f"/album/{album_id}/tracks", {"limit": 100})
-    tracks = []
-    seen = set()
-    for t in data.get("data", []):
-        title = t.get("title_short") or t.get("title")
-        if not title or title in seen:
-            continue
-        seen.add(title)
-        tracks.append({
-            "id": t["id"],
-            "title": title,
-            "preview": t.get("preview", ""),
-            "duration": t.get("duration", 30),
-        })
-    return tracks
-
-# -------------------------------------------------------------------
-# PREVIEW DOWNLOAD
-# -------------------------------------------------------------------
-def download_preview(preview_url: str) -> io.BytesIO:
-    """Download the 30s preview MP3 into memory and return a BytesIO
-    with a .name attribute set so Telegram can detect the file type."""
-    resp = requests.get(preview_url, timeout=15)
-    resp.raise_for_status()
-    buf = io.BytesIO(resp.content)
-    buf.name = "preview.mp3"
-    return buf
-
-# -------------------------------------------------------------------
-# LYRICS
-# -------------------------------------------------------------------
-def fetch_lrclib_lyrics(track_name: str, artist_name: str) -> str:
-    url = "https://lrclib.net/api/get"
-    params = {"track_name": track_name, "artist_name": artist_name}
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
-            lyrics = response.json().get("plainLyrics")
-            return lyrics or "Plain lyrics not available for this track."
-        elif response.status_code == 404:
-            return "❌ Lyrics not found on LRCLIB."
-        return f"⚠️ Server returned status code {response.status_code}."
-    except Exception as e:
-        logger.error(f"LRCLIB API Error: {e}")
-        return "❌ Error connecting to LRCLIB lyrics service."
-
-
-async def send_lyrics_in_chunks(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    MAX_LENGTH = 4000
-    chat_id = update.effective_chat.id
-    if len(text) <= MAX_LENGTH:
-        await context.bot.send_message(chat_id=chat_id, text=text)
-        return
-    current_chunk = ""
-    for line in text.split("\n"):
-        line = line[:MAX_LENGTH]
-        if len(current_chunk) + len(line) + 1 > MAX_LENGTH:
-            await context.bot.send_message(chat_id=chat_id, text=current_chunk)
-            current_chunk = line + "\n"
-        else:
-            current_chunk += line + "\n"
-    if current_chunk.strip():
-        await context.bot.send_message(chat_id=chat_id, text=current_chunk)
-
-# -------------------------------------------------------------------
-# TELEGRAM HANDLERS
-# -------------------------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot_name = context.bot.first_name or "Music Bot"
-    welcome_text = (
-        f"🎵 *Welcome to {bot_name}!*\n\n"
-        "Send me any *artist name* to browse their studio albums, "
-        "get a **30-second preview** and the **lyrics** for any track!"
-    )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
-
-
-async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.message.text.strip()
-    user_id = update.effective_user.id
-    await update.message.reply_text(f"🔍 Searching for artist: {query}...")
-
-    try:
-        artists = await asyncio.to_thread(search_artists, query)
-        if not artists:
-            await update.message.reply_text("❌ No artists found. Try a different name.")
-            return
-
-        artist_data, keyboard = [], []
-        for idx, artist in enumerate(artists):
-            name = artist.get("name", "Unknown Artist")
-            fans = artist.get("nb_fan")
-            label = f"{name} ({fans:,} fans)" if fans else name
-            if len(label) > 60:
-                label = label[:57] + "..."
-            artist_data.append({"id": artist["id"], "name": name})
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"art_{idx}")])
-
-        USER_STATES[user_id] = {"step": "artist_selected", "artists": artist_data}
-        await update.message.reply_text(
-            "👤 Select the artist:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-    except Exception as e:
-        logger.error(f"Deezer artist search error: {e}")
-        await update.message.reply_text(f"❌ Search error: {str(e)[:200]}")
-
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = update.effective_user.id
-    data = query.data
-    user_state = USER_STATES.get(user_id)
-    chat_id = update.effective_chat.id
-
-    if not user_state:
-        await query.edit_message_text("❌ Session expired. Send an artist name to start over.")
-        return
-
-    # STEP 1: Artist ➔ albums
-    if data.startswith("art_"):
-        idx = int(data.split("_")[1])
-        artists = user_state.get("artists", [])
-        if idx >= len(artists):
-            await query.edit_message_text("❌ Selection expired. Send an artist name to search again.")
-            return
-
-        artist = artists[idx]
-        await query.edit_message_text(f"💿 Fetching studio albums for {artist['name']}...")
-
-        try:
-            albums = await asyncio.to_thread(get_studio_albums, artist["id"])
-            if not albums:
-                await query.edit_message_text(f"❌ No studio albums found for {artist['name']}.")
-                return
-
-            albums = albums[:50]
-            keyboard = []
-            for i, alb in enumerate(albums):
-                label = f"{alb['title']} ({alb['year']})"
-                if len(label) > 60:
-                    label = label[:57] + "..."
-                keyboard.append([InlineKeyboardButton(label, callback_data=f"alb_{i}")])
-
-            USER_STATES[user_id] = {
-                "step": "album_selected",
-                "artist_name": artist["name"],
-                "albums": albums,
-            }
-            await query.edit_message_text(
-                f"💿 Studio Albums by {artist['name']}:\nSelect an album below:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
-        except Exception as e:
-            logger.error(f"Deezer albums error: {e}")
-            await query.edit_message_text(f"❌ Error loading albums: {str(e)[:200]}")
-
-    # STEP 2: Album ➔ tracklist
-    elif data.startswith("alb_"):
-        idx = int(data.split("_")[1])
-        albums = user_state.get("albums", [])
-        if idx >= len(albums):
-            await query.edit_message_text("❌ Selection expired. Send an artist name to search again.")
-            return
-
-        album = albums[idx]
-        artist_name = user_state["artist_name"]
-        await query.edit_message_text(f"🎶 Loading tracklist for {album['title']}...")
-
-        try:
-            tracks = await asyncio.to_thread(get_album_tracks, album["id"])
-            if not tracks:
-                await query.edit_message_text("❌ No tracks found for this album.")
-                return
-
-            keyboard = []
-            for i, track in enumerate(tracks[:50]):
-                btn_text = f"{i + 1}. {track['title']}"
-                if len(btn_text) > 60:
-                    btn_text = btn_text[:57] + "..."
-                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"trk_{i}")])
-
-            USER_STATES[user_id] = {
-                "step": "track_selected",
-                "artist_name": artist_name,
-                "album_title": album["title"],
-                "tracks": tracks,
-            }
-
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            caption = (
-                f"💿 {album['title']} ({album['year']})\n"
-                f"👤 Artist: {artist_name}\n\n"
-                f"Select a track to get the **30-second preview** and **lyrics**:"
-            )
-
-            sent_photo = False
-            if album.get("cover"):
-                try:
-                    await context.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=album["cover"],
-                        caption=caption,
-                        parse_mode="Markdown",
-                        reply_markup=reply_markup,
-                    )
-                    await query.delete_message()
-                    sent_photo = True
-                except Exception as e:
-                    logger.error(f"Sending cover photo failed: {e}")
-
-            if not sent_photo:
-                await query.edit_message_text(caption, parse_mode="Markdown", reply_markup=reply_markup)
-        except Exception as e:
-            logger.error(f"Deezer tracks error: {e}")
-            await query.edit_message_text("❌ Error loading tracklist. Please try again.")
-
-    # STEP 3: Track ➔ download preview + send as audio + lyrics
-    elif data.startswith("trk_"):
-        idx = int(data.split("_")[1])
-        tracks = user_state.get("tracks", [])
-        if idx >= len(tracks):
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="❌ Selection expired. Send an artist name to search again.",
-            )
-            return
-
-        track = tracks[idx]
-        track_title = track["title"]
-        artist_name = user_state["artist_name"]
-        album_title = user_state["album_title"]
-        preview_url = track.get("preview", "")
-
-        status_msg = await context.bot.send_message(
-            chat_id=chat_id, text=f"📥 Fetching preview and lyrics for {track_title}..."
-        )
-
-        # 1) Download preview MP3 to memory, then upload to Telegram as a file
-        preview_sent = False
-        if preview_url:
+def load_font(size: int) -> ImageFont.FreeTypeFont:
+    for path in FONT_CANDIDATES:
+        if os.path.exists(path):
             try:
-                audio_buf = await asyncio.to_thread(download_preview, preview_url)
-                await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=audio_buf,
-                    title=track_title,
-                    performer=artist_name,
-                    duration=track.get("duration", 30),
-                    caption=f"🎵 30-second preview: {track_title} — {artist_name}",
-                )
-                preview_sent = True
-            except Exception as e:
-                logger.warning(f"Preview send failed for {track_title}: {e}")
-        else:
-            logger.warning(f"No preview URL available for {track_title}")
-
-        # 2) Fetch and send lyrics (always)
-        lyrics = await asyncio.to_thread(
-            fetch_lrclib_lyrics, track_name=track_title, artist_name=artist_name
-        )
-
-        header = (
-            f"🎤 {track_title}\n"
-            f"👤 Artist: {artist_name}\n"
-            f"💿 Album: {album_title}\n"
-        )
-        if not preview_sent:
-            header += "⚠️ Preview audio unavailable (lyrics only)\n"
-        header += "────────────────────────\n\n"
-
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
-        except Exception:
-            pass
-        await send_lyrics_in_chunks(update, context, header + lyrics)
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    logger.warning("No system font found; falling back to Pillow default.")
+    return ImageFont.load_default()
 
 # -------------------------------------------------------------------
-# MAIN APPLICATION
+# TEXT RENDERING
+# -------------------------------------------------------------------
+def wrap_text(draw, text, font, max_width):
+    """Greedy word-wrap using actual rendered width."""
+    words = text.split()
+    lines, current = [], ""
+    for w in words:
+        trial = (current + " " + w).strip()
+        if draw.textlength(trial, font=font) <= max_width:
+            current = trial
+        else:
+            if current:
+                lines.append(current)
+            current = w
+    if current:
+        lines.append(current)
+    return lines
+
+
+def fit_text(draw, text, max_width, max_height, start_size=120, min_size=20):
+    """Shrink font until wrapped text fits in max_width x max_height."""
+    size = start_size
+    while size >= min_size:
+        font = load_font(size)
+        lines = wrap_text(draw, text, font, max_width)
+        line_height = size + 8
+        total_height = line_height * len(lines)
+        if total_height <= max_height and all(
+            draw.textlength(l, font=font) <= max_width for l in lines
+        ):
+            return font, lines, line_height
+        size -= 4
+    font = load_font(min_size)
+    return font, wrap_text(draw, text, font, max_width), min_size + 8
+
+
+def draw_styled_text(draw, lines, font, line_height, center_x, start_y,
+                     style="classic", image_size=None):
+    """Draw text with stroke/shadow/outline depending on style."""
+    y = start_y
+    for line in lines:
+        w = draw.textlength(line, font=font)
+        x = center_x - w / 2
+        if style == "classic":
+            draw.text((x, y), line, font=font, fill="white",
+                      stroke_width=max(2, font.size // 12), stroke_fill="black")
+        elif style == "outline":
+            draw.text((x, y), line, font=font, fill="white",
+                      stroke_width=max(2, font.size // 10), stroke_fill="black")
+        elif style == "shadow":
+            shadow_off = max(2, font.size // 20)
+            draw.text((x + shadow_off, y + shadow_off), line,
+                      font=font, fill="black")
+            draw.text((x, y), line, font=font, fill="white")
+        elif style == "clean":
+            draw.text((x, y), line, font=font, fill="black")
+        else:
+            draw.text((x, y), line, font=font, fill="white",
+                      stroke_width=2, stroke_fill="black")
+        y += line_height
+
+
+def make_meme(image_bytes: bytes, caption: str, style: str = "classic") -> io.BytesIO:
+    """Render a meme and return a BytesIO PNG."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    # Cap size for performance (Telegram photos don't need 8K)
+    max_dim = 1200
+    if max(img.size) > max_dim:
+        ratio = max_dim / max(img.size)
+        img = img.resize(
+            (int(img.width * ratio), int(img.height * ratio)),
+            Image.LANCZOS,
+        )
+
+    if style == "whiteborder":
+        # Add white border around the image first
+        border = max(10, img.width // 40)
+        canvas = Image.new("RGB",
+                           (img.width + border * 2, img.height + border * 2),
+                           "white")
+        canvas.paste(img, (border, border))
+        img = canvas
+
+    draw = ImageDraw.Draw(img)
+    W, H = img.size
+
+    # Split top/bottom on "|"
+    if "|" in caption:
+        top_text, bottom_text = [p.strip() for p in caption.split("|", 1)]
+    else:
+        top_text, bottom_text = caption.strip(), ""
+
+    margin_x = max(20, W // 30)
+    max_text_width = W - margin_x * 2
+    max_text_height = H // 2 - 20
+
+    if top_text:
+        font, lines, lh = fit_text(draw, top_text.upper(), max_text_width,
+                                   max_text_height, start_size=max(40, W // 12))
+        draw_styled_text(draw, lines, font, lh, W / 2, 20, style=style)
+
+    if bottom_text:
+        font, lines, lh = fit_text(draw, bottom_text.upper(), max_text_width,
+                                   max_text_height, start_size=max(40, W // 12))
+        total_h = lh * len(lines)
+        start_y = H - total_h - 20
+        draw_styled_text(draw, lines, font, lh, W / 2, start_y, style=style)
+
+    out = io.BytesIO()
+    img.save(out, format="PNG", optimize=True)
+    out.seek(0)
+    out.name = "meme.png"
+    return out
+
+# -------------------------------------------------------------------
+# IMAGE FETCHING
+# -------------------------------------------------------------------
+def download_image(file_id: str) -> bytes:
+    """Download a Telegram file by file_id using Bot API file URL.
+    NOTE: we need the token; passed via closure in the handler instead."""
+    raise NotImplementedError  # replaced below by handler-level download
+
+
+async def fetch_telegram_file(context, file_id: str) -> bytes:
+    tg_file = await context.bot.get_file(file_id)
+    buf = io.BytesIO()
+    await tg_file.download_to_memory(buf)
+    return buf.getvalue()
+
+# -------------------------------------------------------------------
+# HANDLERS
+# -------------------------------------------------------------------
+STYLE_LABELS = {
+    "classic": "🖤 Classic Impact",
+    "outline": "⚪ Heavy Outline",
+    "shadow": "🌑 Drop Shadow",
+    "clean": "📄 Clean Black",
+    "whiteborder": "🖼️ White Border",
+}
+
+
+def build_style_keyboard(cache_key: str):
+    rows = []
+    row = []
+    for i, (style, label) in enumerate(STYLE_LABELS.items()):
+        row.append(InlineKeyboardButton(label, callback_data=f"style|{style}|{cache_key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🎨 *Meme Generator Bot*\n\n"
+        "Send me a *photo* with a caption to make a meme.\n\n"
+        "*Caption format:*\n"
+        "`top text` → top only\n"
+        "`top text | bottom text` → top and bottom\n\n"
+        "Then tap a style button to re-render.\n\n"
+        "Try `/help` for tips."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🆘 *How to use*\n\n"
+        "1. Send a photo *with a caption* (or reply to an image with text).\n"
+        "2. Use `|` to split top/bottom: `when the code | finally works`\n"
+        "3. Tap a style button to re-render.\n\n"
+        "*Styles:*\n"
+        "• Classic Impact — white text, black stroke\n"
+        "• Heavy Outline — thick white-on-black\n"
+        "• Drop Shadow — subtle shadow\n"
+        "• Clean Black — black text, no stroke\n"
+        "• White Border — adds a white frame\n\n"
+        "*Tips:*\n"
+        "• Long captions auto-shrink and wrap.\n"
+        "• Works best with landscape/square images."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.photo:
+        return
+
+    caption = (msg.caption or "").strip()
+    if not caption:
+        await msg.reply_text(
+            "✏️ Send the photo *with a caption* so I know what to write.\n"
+            "Format: `top text | bottom text`",
+            parse_mode="Markdown",
+        )
+        return
+
+    status = await msg.reply_text("🎨 Rendering your meme...")
+
+    try:
+        # Largest photo size is the last item
+        file_id = msg.photo[-1].file_id
+        image_bytes = await fetch_telegram_file(context, file_id)
+
+        # Render default style
+        meme_buf = await asyncio.to_thread(make_meme, image_bytes, caption, "classic")
+
+        sent = await msg.reply_photo(photo=meme_buf, caption="✅ Here's your meme — pick a style to re-render:")
+
+        # Cache for style re-renders
+        cache_key = str(sent.message_id)
+        MEME_CACHE[cache_key] = {
+            "image_bytes": image_bytes,
+            "caption": caption,
+            "user_id": msg.from_user.id,
+        }
+        # Trim cache
+        while len(MEME_CACHE) > MAX_CACHE:
+            MEME_CACHE.pop(next(iter(MEME_CACHE)))
+
+        await context.bot.edit_message_reply_markup(
+            chat_id=sent.chat_id,
+            message_id=sent.message_id,
+            reply_markup=build_style_keyboard(cache_key),
+        )
+        await status.delete()
+    except Exception as e:
+        logger.exception("Meme render failed")
+        await status.edit_text(f"❌ Couldn't render that meme: {str(e)[:200]}")
+
+
+async def handle_text_reply_to_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow replying to a photo with text to make a meme."""
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return
+    replied = msg.reply_to_message
+    if not replied.photo:
+        return
+
+    caption = (msg.text or "").strip()
+    if not caption:
+        return
+
+    status = await msg.reply_text("🎨 Rendering your meme...")
+    try:
+        file_id = replied.photo[-1].file_id
+        image_bytes = await fetch_telegram_file(context, file_id)
+        meme_buf = await asyncio.to_thread(make_meme, image_bytes, caption, "classic")
+        sent = await msg.reply_photo(photo=meme_buf, caption="✅ Pick a style:")
+        cache_key = str(sent.message_id)
+        MEME_CACHE[cache_key] = {
+            "image_bytes": image_bytes,
+            "caption": caption,
+            "user_id": msg.from_user.id,
+        }
+        while len(MEME_CACHE) > MAX_CACHE:
+            MEME_CACHE.pop(next(iter(MEME_CACHE)))
+        await context.bot.edit_message_reply_markup(
+            chat_id=sent.chat_id,
+            message_id=sent.message_id,
+            reply_markup=build_style_keyboard(cache_key),
+        )
+        await status.delete()
+    except Exception as e:
+        logger.exception("Meme render (reply) failed")
+        await status.edit_text(f"❌ Couldn't render that meme: {str(e)[:200]}")
+
+
+async def handle_style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Re-rendering...")
+
+    try:
+        _, style, cache_key = query.data.split("|", 2)
+    except ValueError:
+        await query.edit_message_caption(caption="❌ Invalid style selection.")
+        return
+
+    entry = MEME_CACHE.get(cache_key)
+    if not entry:
+        await query.edit_message_caption(
+            caption="⌛ This meme expired. Send the photo again to re-render."
+        )
+        return
+
+    try:
+        meme_buf = await asyncio.to_thread(
+            make_meme, entry["image_bytes"], entry["caption"], style
+        )
+        await query.edit_message_media(
+            media=__import__("telegram").InputMediaPhoto(
+                media=meme_buf,
+                caption=f"✅ Style: {STYLE_LABELS.get(style, style)}\nPick another:",
+            ),
+            reply_markup=build_style_keyboard(cache_key),
+        )
+    except Exception as e:
+        logger.exception("Style re-render failed")
+        await query.edit_message_caption(caption=f"❌ Style render failed: {str(e)[:150]}")
+
+
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤔 I only understand photos with captions and /start, /help."
+    )
+
+# -------------------------------------------------------------------
+# MAIN
 # -------------------------------------------------------------------
 def main():
     threading.Thread(target=run_health_server, daemon=True).start()
@@ -457,10 +397,19 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CallbackQueryHandler(handle_style_callback, pattern=r"^style\|"))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    # Reply-to-photo with text (text messages that are replies)
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.REPLY,
+            handle_text_reply_to_photo,
+        )
+    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
 
-    print("🤖 Bot is running...")
+    print("🎨 Meme bot is running...")
     app.run_polling()
 
 
