@@ -19,7 +19,7 @@ from telegram.ext import (
 # -------------------------------------------------------------------
 # CONFIGURATION
 # -------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ["8724485150:AAEbDfndk1cr1EbqikY_XNxSsJq4vJK7G6k"]
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 DEEZER = "https://api.deezer.com"
 
 logging.basicConfig(
