@@ -43,6 +43,89 @@ LRCLIB_GET = "https://lrclib.net/api/get"
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
  
 # -------------------------------------------------------------------
+# TEXTS (English + Amharic)
+# -------------------------------------------------------------------
+STRINGS = {
+    "en": {
+        "choose_lang": "🌍 Choose your language / ቋንቋዎን ይምረጡ 👇",
+        "lang_set": "✅ Language set to English! 🇺🇸🇬🇧",
+        "welcome": (
+            "🎤🎶 Lyrics Bot 🎶🎤\n\n"
+            "🔎 Type a song name (add the artist for best results, "
+            "like \"humble kendrick\") and pick the right version.\n\n"
+            "🎧 Or send a voice note / audio of a song playing and I'll "
+            "identify it and send the lyrics.\n\n"
+            "🌍 Change language anytime with /language"
+        ),
+        "searching": "🔎 Searching...",
+        "no_results": "❌ No songs found 🤔 Try adding the artist's name.",
+        "which_one": "🎵 Which one do you mean? 👇",
+        "getting_lyrics": "📜 Getting lyrics...",
+        "track_failed": "❌ Couldn't load that song 😕 Try searching again.",
+        "lyrics_missing": "❌ Lyrics not found for this one 😔",
+        "listening": "🎧 Listening...",
+        "not_recognized": (
+            "❌ I couldn't recognize that 🙈 Try again with clearer audio "
+            "or a longer clip 🎙️"
+        ),
+        "audd_invalid": "❌ That audio format didn't work 🎵 Try a different file.",
+        "audd_error": "❌ Music recognition error 🛠️: {err}",
+        "generic_error": "❌ Something went wrong 😵: {err}",
+    },
+    "am": {
+        "choose_lang": "🌍 ቋንቋዎን ይምረጡ / Choose your language 👇",
+        "lang_set": "✅ ቋንቋ ወደ አማርኛ ተቀይሯል! 🇪🇹",
+        "welcome": (
+            "🎤🎶 የግጥም ቦት 🎶🎤\n\n"
+            "🔎 የዘፈን ስም ይጻፉ (ለተሻለ ውጤት የአርቲስቱን ስም ይጨምሩ፣ "
+            "ለምሳሌ \"humble kendrick\") እና ትክክለኛውን ይምረጡ።\n\n"
+            "🎧 ወይም የሚጫወት ዘፈን የድምፅ መልዕክት ወይም ኦዲዮ ይላኩ፣ "
+            "እኔ ለይቼ ግጥሙን እልክልዎታለሁ።\n\n"
+            "🌍 ቋንቋ ለመቀየር በማንኛውም ጊዜ /language ይላኩ"
+        ),
+        "searching": "🔎 በመፈለግ ላይ...",
+        "no_results": "❌ ምንም ዘፈን አልተገኘም 🤔 የአርቲስቱን ስም ጨምረው ይሞክሩ።",
+        "which_one": "🎵 የትኛውን ማለትዎ ነው? 👇",
+        "getting_lyrics": "📜 ግጥሙን በማምጣት ላይ...",
+        "track_failed": "❌ ዘፈኑን መጫን አልተቻለም 😕 እንደገና ይፈልጉ።",
+        "lyrics_missing": "❌ ለዚህ ዘፈን ግጥም አልተገኘም 😔",
+        "listening": "🎧 በማዳመጥ ላይ...",
+        "not_recognized": (
+            "❌ ዘፈኑን መለየት አልቻልኩም 🙈 ጥርት ያለ ድምፅ ወይም "
+            "ረጅም ክሊፕ ይሞክሩ 🎙️"
+        ),
+        "audd_invalid": "❌ የኦዲዮ ፎርማቱ አልሰራም 🎵 ሌላ ፋይል ይሞክሩ።",
+        "audd_error": "❌ የሙዚቃ መለያ ስህተት 🛠️: {err}",
+        "generic_error": "❌ ችግር ተፈጥሯል 😵: {err}",
+    },
+}
+ 
+ 
+def get_lang(context) -> str | None:
+    return context.user_data.get("lang")
+ 
+ 
+def tr(context, key: str, **kwargs) -> str:
+    """Translate a UI string using the user's chosen language (English by default)."""
+    lang = get_lang(context) or "en"
+    return STRINGS[lang][key].format(**kwargs)
+ 
+ 
+def language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🇺🇸🇬🇧 English", callback_data="lang:en")],
+            [InlineKeyboardButton("🇪🇹 አማርኛ (Amharic)", callback_data="lang:am")],
+        ]
+    )
+ 
+ 
+async def ask_language(message):
+    await message.reply_text(
+        STRINGS["en"]["choose_lang"], reply_markup=language_keyboard()
+    )
+ 
+# -------------------------------------------------------------------
 # HEALTH SERVER (Render)
 # -------------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -162,8 +245,8 @@ def lrclib_search(artist, title, duration=0) -> str | None:
         return None
  
  
-def fetch_lyrics(artist: str, title: str, album: str = "", duration: int = 0) -> str:
-    """Try exact match first, then looser matches."""
+def fetch_lyrics(artist: str, title: str, album: str = "", duration: int = 0) -> str | None:
+    """Try exact match first, then looser matches. Returns None if nothing found."""
     base = clean_title(title)
     attempts = [
         lambda: lrclib_get(artist, title, album, duration),
@@ -175,7 +258,7 @@ def fetch_lyrics(artist: str, title: str, album: str = "", duration: int = 0) ->
         lyrics = attempt()
         if lyrics:
             return lyrics
-    return "❌ Lyrics not found for this one."
+    return None
  
 # -------------------------------------------------------------------
 # SENDING
@@ -203,7 +286,7 @@ async def send_lyrics_chunked(chat_id: int, context, header: str, lyrics: str):
  
  
 def make_header(title, artist, album):
-    header = f"🎤 {title}\n👤 {artist}"
+    header = f"🎶 {title} 🎶\n👤 {artist}"
     if album:
         header += f"\n💿 {album}"
     return header
@@ -212,12 +295,23 @@ def make_header(title, artist, album):
 # HANDLERS
 # -------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎤 Lyrics Bot\n\n"
-        "• Type a song name (add the artist for best results, "
-        "like \"humble kendrick\") and pick the right version.\n"
-        "• Or send a voice note / audio of a song playing and I'll identify it "
-        "and send the lyrics."
+    # Always ask for language on /start
+    await ask_language(update.message)
+ 
+ 
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ask_language(update.message)
+ 
+ 
+async def handle_language_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    lang = q.data.split(":", 1)[1]
+    if lang not in STRINGS:
+        return
+    context.user_data["lang"] = lang
+    await q.edit_message_text(
+        STRINGS[lang]["lang_set"] + "\n\n" + STRINGS[lang]["welcome"]
     )
  
  
@@ -226,16 +320,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
  
-    status = await update.message.reply_text("🔎 Searching...")
+    if not get_lang(context):
+        await ask_language(update.message)
+        return
+ 
+    status = await update.message.reply_text(tr(context, "searching"))
     tracks = await asyncio.to_thread(search_deezer_tracks, query)
  
     if not tracks:
-        await status.edit_text("❌ No songs found. Try adding the artist's name.")
+        await status.edit_text(tr(context, "no_results"))
         return
  
     buttons = []
     for t in tracks:
-        label = f"{t['title']} — {t['artist']}"
+        label = f"🎵 {t['title']} — {t['artist']}"
         if t["album"]:
             label += f" ({t['album']})"
         buttons.append(
@@ -243,7 +341,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
  
     await status.edit_text(
-        "Which one do you mean? 👇",
+        tr(context, "which_one"),
         reply_markup=InlineKeyboardMarkup(buttons),
     )
  
@@ -257,11 +355,11 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (ValueError, IndexError):
         return
  
-    await q.edit_message_text("📜 Getting lyrics...")
+    await q.edit_message_text(tr(context, "getting_lyrics"))
  
     track = await asyncio.to_thread(get_deezer_track, track_id)
     if not track:
-        await q.edit_message_text("❌ Couldn't load that song. Try searching again.")
+        await q.edit_message_text(tr(context, "track_failed"))
         return
  
     lyrics = await asyncio.to_thread(
@@ -271,6 +369,10 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         track["album"],
         track["duration"],
     )
+ 
+    if not lyrics:
+        await q.edit_message_text(tr(context, "lyrics_missing"))
+        return
  
     header = make_header(track["title"], track["artist"], track["album"])
     await send_lyrics_chunked(q.message.chat_id, context, header, lyrics)
@@ -300,6 +402,10 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
     if not msg:
         return
  
+    if not get_lang(context):
+        await ask_language(msg)
+        return
+ 
     file_id = None
     if msg.voice:
         file_id = msg.voice.file_id
@@ -311,32 +417,34 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
     if not file_id:
         return
  
-    status = await msg.reply_text("🎧 Listening...")
+    status = await msg.reply_text(tr(context, "listening"))
  
     try:
         audio_bytes = await fetch_telegram_file(context, file_id)
         song = await asyncio.to_thread(recognize_audio, audio_bytes)
  
         if not song:
-            await status.edit_text(
-                "❌ I couldn't recognize that. Try again with clearer audio or a longer clip."
-            )
+            await status.edit_text(tr(context, "not_recognized"))
             return
  
         artist, title, album = song["artist"], song["title"], song["album"]
  
         lyrics = await asyncio.to_thread(fetch_lyrics, artist, title, album)
+        if not lyrics:
+            await status.edit_text(tr(context, "lyrics_missing"))
+            return
+ 
         await send_lyrics_chunked(msg.chat_id, context, make_header(title, artist, album), lyrics)
         await status.delete()
  
     except AudDInvalidAudioError:
-        await status.edit_text("❌ AudD rejected the audio format. Try a different file.")
+        await status.edit_text(tr(context, "audd_invalid"))
     except AudDAPIError as e:
         logger.error(f"AudD API error: {e}")
-        await status.edit_text(f"❌ Music recognition service error: {str(e)[:150]}")
+        await status.edit_text(tr(context, "audd_error", err=str(e)[:150]))
     except Exception as e:
         logger.exception("Unexpected error in voice handler")
-        await status.edit_text(f"❌ Something went wrong: {str(e)[:200]}")
+        await status.edit_text(tr(context, "generic_error", err=str(e)[:200]))
  
 # -------------------------------------------------------------------
 # MAIN (Python 3.14 event-loop fix)
@@ -352,6 +460,8 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
  
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("language", language_command))
+    app.add_handler(CallbackQueryHandler(handle_language_pick, pattern=r"^lang:(en|am)$"))
     app.add_handler(CallbackQueryHandler(handle_pick, pattern=r"^t:\d+$"))
     app.add_handler(
         MessageHandler(
@@ -367,3 +477,4 @@ def main():
  
 if __name__ == "__main__":
     main()
+ 
