@@ -19,7 +19,7 @@ from telegram.ext import (
 # CONFIGURATION
 # -------------------------------------------------------------------
 # Set this as an environment variable on Render (never hardcode it)
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_BOT_TOKEN = os.environ["8724485150:AAEbDfndk1cr1EbqikY_XNxSsJq4vJK7G6k"]
 
 DEEZER = "https://api.deezer.com"
 
